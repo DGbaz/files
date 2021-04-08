@@ -1,0 +1,283 @@
+#!/bin/bash
+
+GV_ROOT=/opt/guardvant
+
+fatal()
+{
+    echo "$*" 1>&2
+    exit 1
+}
+
+info()
+{
+    echo "$*" 1>&2
+}
+
+usage()
+{
+    cat <<EOF 1>&2
+
+Extracts GvOS server, client, and OpWeb .tar.gz packages in a single step.
+usage: $(basename $0) [-d] <package> <package> ...
+   any package with a "-d" will be set as the default package of that type
+   packages can be GvOS server, GvOS client, or OpWeb packages
+   if no defaults are provided, they are assumed for server and OpWeb packages
+
+   example: $(basename $0) gvos-4.0-7.tar.gz gvpc-x86_64-4.0-7.tar.gz opweb-3.00-11.tar.gz
+             will install the 4.0-7 server, 4.0-7 client, and 3.00-12 OpWeb
+
+EOF
+    exit 1
+}
+
+make_symlink()
+{
+    local dir=$1
+    local link=$2
+
+    [ -L $link ] && rm -f $link
+    [ -d $link ] && {
+        info "saving $link in $link.old"
+        rm -rf $link.old
+        mv $link $link.old
+    }
+    ln -ns $dir $link
+}
+
+make_all_dirs()
+{
+    local admin_group=sudo
+    grep -q ^wheel: /etc/group && admin_group=wheel
+
+    groups | grep -q $admin_group || fatal $USER is not allowed to execute sudo
+    [ $admin_group = wheel ] && {
+        groups root | grep -q " wheel" || {
+            info "adding root to wheel group"
+            sudo usermod -G wheel root
+        }
+    }
+    [ -d $GV_ROOT ] || {
+        [ -f /etc/sudoers ] || fatal sudo is not installed
+        sudo cat /etc/sudoers | grep -q 'Defaults.*requiretty' && {
+            info "removing requiretty from /etc/sudoers"
+            sudo sed -i '/Defaults.*requiretty/d' /etc/sudoers
+        }
+        sudo mkdir -p $GV_ROOT && sudo chown guardvant:guardvant $GV_ROOT || \
+                fatal "unable to create $GV_ROOT directory"
+   }
+   for dir in versions releases logs run clients
+   do
+       mkdir -p $GV_ROOT/$dir
+   done
+}
+
+# older script (<ver 5.1) appended to or created .bash_profile, remove
+remove_old_root_profile()
+{
+    local profile=~/.bash_profile
+    local ptemp=`mktemp`
+    [ -f "$profile" ] || return
+    # try to delete the profile from .bash_profile, preserving extra content
+    # presumes the profile contains a GvOS statement and four exports
+    awk '/^# GvOS profile/ {delnext=5; next;}
+         delnext>0  {if($1!~/^export/) delnext=0;}
+         delnext>0  {if($1~/^export/)  delnext=delnext-1;}
+	 delnext==0 {print;}' "$profile" > $ptemp
+    mv $ptemp $profile ||  \
+	    info PROFILE NOT WRITABLE, DELETE ANY OLD GvOS PROFILE IN $profile
+    # if the old profile is now empty (common on Ubuntu which uses .bashrc), delete it
+    [ -s "$profile" ] || rm -f "$profile"
+}
+
+add_gv_root_profile()
+{
+    local gvos_profile=~/.gvos_profile
+    local profile=; local ptemp=`mktemp`
+
+    [ -f $gvos_profile ] && mv $gvos_profile $gvos_profile.old
+    cat <<EOF >> $gvos_profile
+# GuardVant profile
+export GV_ROOT=$GV_ROOT
+export PATH=\$GV_ROOT/bin:\$PATH
+export GV_CLASSPATH=\$GV_ROOT/lib:/opt/local/lib
+export LD_LIBRARY_PATH=\$GV_CLASSPATH:\$LD_LIBRARY_PATH
+EOF
+
+# add our profile to an existing profile following bash's profile order (OPG-668)
+# add in only the first because bash only runs the first it finds
+    for p in `ls -d ~/.??*`; do
+        case `basename $p` in
+            .bashrc)       profile="$p"; break;;
+            .bash_profile) profile="$p"; break;;
+	    .bash_login)   profile="$p"; break;;
+	    .profile)      profile="$p"; break;;
+	esac
+    done
+    [ -f "$profile" ] || profile=".bashrc"
+    awk -v c=". $gvos_profile" '$0~c {next;}{print;} END{print c;}' $profile >$ptemp
+    mv $ptemp $profile ||  \
+	    info UNABLE TO ADD $gvos_profile TO $profile, PROFILE NOT WRITABLE, ADD ". $gvos_profile" MANUALLY
+    info environment variables added to $gvos_profile, please log out and log back in
+}
+
+# copy file if different from destination
+copy_file()
+{
+    local from=$1
+    local to=$2
+
+    [ -f $to ] && [ $(stat -c %i $from) = $(stat -c %i $to) ] && return
+    cp $from $to
+}
+
+extract_client()
+{
+    local package=$1
+    local clients=$GV_ROOT/releases
+    local version=$(basename $pkg .tar.gz)
+    local app=${version%%-*}
+
+    # determine application and version number from package name
+
+    version=${version#*-}
+    app=$app-${version%%-*}
+    version=${version#*-}
+
+    [ -z "$app" -o -z "$version" -o ! -f $package ] && \
+        fatal $package is not a mobile client package
+    copy_file $package $clients/$(basename $pkg)
+    mkdir -p $clients
+    rm -rf $clients/$app/$version
+    tar -xzf $package -C $clients || fatal extract of client \"$package\" failed
+}
+
+extract_opweb()
+{
+   local package=$1
+   local default_version=$2
+
+   [ -f $package ] || {
+       info "opWeb package \"$package\" was not found."
+       return
+   }
+
+   # NOTE: OpWeb is packaged with a version as the top level dir name, need this for soft link
+   local version=`tar -tzf $package | awk -F '/' ' $1~/^[0-9]+\.[0-9]+[-.]/ {print $1; exit;}'`
+   [ -n "$version" ] || fatal examination of $package failed, expected top-level dir to be version
+
+   local opweb=$GV_ROOT/opweb
+   mkdir -p $opweb
+   rm -rf $opweb/$version
+   tar -xzf $package -C $opweb || fatal extract of opweb \"$package\" failed
+   [ $default_version = yes ] &&  make_symlink $opweb/$version $opweb/current
+}
+
+extract_server()
+{
+   local package=$1
+   local default_version=$2
+   local file=$(basename $package .tar.gz)
+   local version=${file#gvos-}
+   local versions=$GV_ROOT/versions
+   
+   [ "$version" = "$file" -o -z "$version" ] && fatal $package is not a gvos server package
+
+   rm -rf $versions/$version
+   mkdir -p $versions/$version/temp
+
+   tar -xz -C $versions/$version/temp -f $package || fatal extract of $package failed
+   mv $versions/$version/temp/$GV_ROOT/* $versions/$version || fatal cannot move files to $versions/$version
+   rm -rf $versions/$version/temp
+   [ $default_version = yes ] && {
+       make_symlink $version $versions/current
+       make_symlink versions/current/bin $GV_ROOT/bin
+       make_symlink versions/current/lib $GV_ROOT/lib
+       make_symlink versions/current/db $GV_ROOT/db
+       make_symlink versions/current/models $GV_ROOT/models
+
+       # relocate the run symlinks to the run directory to keep client configurations
+       # out of the scripts directory.
+       for init in $(grep -l 'guardvant/scripts/\$' /etc/init.d/*)
+       do
+           server=$(basename $init)
+           if [ -f $GV_ROOT/scripts/$server.run ]
+           then
+               info relocating $server to $GV_ROOT/run
+               sudo sed -i 's@guardvant/scripts@guardvant/run@g' $init
+               [ -L $GV_ROOT/scripts/$server ] \
+                   && link=$(ls -l $GV_ROOT/scripts/$server | awk '{print $NF}') \
+                   || link=gvos
+               rm -f $GV_ROOT/scripts/$server.run
+               rm -f $GV_ROOT/scripts/$server
+               ln -s ../scripts/gvrun $GV_ROOT/run/$server.run
+               ln -s ../scripts/$link $GV_ROOT/run/$server
+           else
+               info cannot determine server for $init
+           fi
+       done
+       make_symlink versions/current/scripts $GV_ROOT/scripts
+   }
+}
+
+
+
+
+[ $# -gt 0 ] || usage
+[ $(id -u) = 0 ] && fatal cannot be run by user root
+echo " "
+
+make_all_dirs
+remove_old_root_profile
+add_gv_root_profile
+
+# keep track of clients, opwebs, and serversR installed
+processed_clients=""
+processed_opwebs=""
+processed_servers=""
+
+while [ $# -gt 0 ]
+do
+    arg=$1
+    shift
+
+    [ -z "$default_version"  ] && default_version=no
+    [ $default_version = yes ] && default_version=no
+    [ $default_version = set ] && default_version=yes
+
+    case "$arg" in
+        -d) default_version=set ;;
+        -*) usage ;;
+
+        *)  [ -f "$arg" ] || {
+                info package \"$arg\" was not found
+                usage
+            }
+            pkg=$arg
+            basepkg=$(basename $pkg)
+            case "$basepkg" in
+                gvpc-*|oaslv-*|gvmr-*)
+                    extract_client $pkg
+                    processed_clients="$processed_clients $basepkg"
+                    ;;
+                opweb-*)
+                    [ -d $GV_ROOT/opweb/current ] || default_version=yes
+                    extract_opweb $pkg $default_version
+                    processed_opwebs="$processed_opwebs $basepkg"
+                    ;;
+                gvos-*)
+                    [ -d $GV_ROOT/versions/current ] || default_version=yes
+                    extract_server $pkg $default_version
+                    processed_servers="$processed_servers $basepkg"
+                    ;;
+                *)
+                    fatal argument \"$package\" is not a recognised package type
+                    ;;
+            esac
+    esac
+done
+echo " "
+info "extracted servers:	$processed_servers"
+info "extracted clients:	$processed_clients"
+info "extracted web:		$processed_opwebs"
+echo " "
+
